@@ -19,6 +19,13 @@
     "archived": {
       "description": "Indicates whether the line item is archived or not.",
       "type": ["null", "boolean"]
+    },
+    "deals": {
+      "description": "Information about deals associated with the invoice",
+      "items": {
+        "type": ["null", "string"]
+      },
+      "type": ["null", "array"]
     }
   }
 }
