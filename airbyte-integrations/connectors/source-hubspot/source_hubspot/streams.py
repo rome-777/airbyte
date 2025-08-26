@@ -29,7 +29,7 @@ from airbyte_cdk.sources.utils.schema_helpers import ResourceSchemaLoader
 from airbyte_cdk.sources.utils.transform import TransformConfig, TypeTransformer
 from airbyte_cdk.utils import AirbyteTracedException
 from requests import HTTPError, codes
-from source_hubspot.constants import OAUTH_CREDENTIALS, PRIVATE_APP_CREDENTIALS
+from source_hubspot.constants import HUBSPOT_OBJECT_TYPE_MAPPINGS, OAUTH_CREDENTIALS, PRIVATE_APP_CREDENTIALS
 from source_hubspot.errors import HubspotAccessDenied, HubspotInvalidAuth, HubspotRateLimited, HubspotTimeout, InvalidStartDateConfigError
 from source_hubspot.helpers import (
     APIPropertiesWithHistory,
@@ -263,7 +263,7 @@ class API:
         response = self._session.post(self.BASE_URL + url, params=params, json=data)
         return self._parse_and_handle_errors(response), response
 
-    def get_custom_objects_metadata(self) -> Iterable[Tuple[str, str, Mapping[str, Any]]]:
+    def get_custom_objects_metadata(self) -> Iterable[Tuple[str, str, Mapping[str, Any], Mapping[str, Any], List[str]]]:
         data, response = self.get("/crm/v3/schemas", {})
         if not response.ok or "results" not in data:
             self.logger.warn(self._parse_and_handle_errors(response))
@@ -271,7 +271,30 @@ class API:
         for metadata in data["results"]:
             properties = self.get_properties(raw_schema=metadata)
             schema = self.generate_schema(properties)
-            yield metadata["name"], metadata["fullyQualifiedName"], schema, properties
+            associations = self._extract_associations_from_metadata(metadata)
+            yield metadata["name"], metadata["fullyQualifiedName"], schema, properties, associations
+
+    def _extract_associations_from_metadata(self, metadata: Mapping[str, Any]) -> List[str]:
+        """Extract available associations from custom object metadata."""
+        associations = []
+        ignored_associations = []
+        
+        for association_def in metadata.get("associations", []):
+            to_object_type_id = str(association_def["toObjectTypeId"])
+            object_name = HUBSPOT_OBJECT_TYPE_MAPPINGS.get(to_object_type_id)
+            
+            if object_name:
+                associations.append(object_name)
+            else:
+                association_name = str(association_def["name"])
+                ignored_associations.append((to_object_type_id, association_name))
+        
+        if associations:
+            self.logger.info(f"Found associations: {associations}")
+        if ignored_associations:
+            self.logger.info(f"Ignored associations: {ignored_associations}")
+        
+        return associations
 
     def get_properties(self, raw_schema: Mapping[str, Any]) -> Mapping[str, Any]:
         return {field["name"]: self._field_to_property_schema(field) for field in raw_schema["properties"]}
@@ -934,7 +957,9 @@ class AssociationsStream(Stream):
         next_page_token: Mapping[str, Any] = None,
         properties: IURLPropertyRepresentation = None,
     ) -> str:
-        return f"/crm/v4/associations/{self.parent_stream.entity}/{stream_slice}/batch/read"
+        # Use fully_qualified_name for custom objects, entity for standard objects
+        object_name = getattr(self.parent_stream, 'fully_qualified_name', None) or self.parent_stream.entity
+        return f"/crm/v4/associations/{object_name}/{stream_slice}/batch/read"
 
     def scopes(self) -> Set[str]:
         return self.parent_stream.scopes
@@ -2272,12 +2297,13 @@ class CustomObject(CRMSearchStream, ABC):
     primary_key = "id"
     scopes = {"crm.schemas.custom.read", "crm.objects.custom.read"}
 
-    def __init__(self, entity: str, schema: Mapping[str, Any], fully_qualified_name: str, custom_properties: Mapping[str, Any], **kwargs):
+    def __init__(self, entity: str, schema: Mapping[str, Any], fully_qualified_name: str, custom_properties: Mapping[str, Any], associations: List[str] = None, **kwargs):
         super().__init__(**kwargs)
         self.entity = entity
         self.schema = schema
         self.fully_qualified_name = fully_qualified_name
         self.custom_properties = custom_properties
+        self.associations = associations or []
 
     @property
     def url(self):
@@ -2289,7 +2315,20 @@ class CustomObject(CRMSearchStream, ABC):
         return self.entity
 
     def get_json_schema(self) -> Mapping[str, Any]:
-        return self.schema
+        json_schema = self.schema.copy()
+        
+        # Add association properties to the schema
+        if self.associations:
+            for association in self.associations:
+                json_schema["properties"][association] = {
+                    "description": f"List of {association} associated with this custom object",
+                    "type": ["null", "array"],
+                    "items": {
+                        "type": ["null", "string"]
+                    }
+                }
+        
+        return json_schema
 
     @property
     def properties(self) -> Mapping[str, Any]:
